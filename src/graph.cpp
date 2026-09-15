@@ -2,6 +2,9 @@
 #include "sequence.h"
 #include <queue>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 #include "file_io.h"
 extern char char26_table[256];
 int graph::add_node(para_t *para, char base) {
@@ -168,7 +171,10 @@ void graph::init(para_t *para, int seq_id, const std::string &str, PathWriter *w
     pre_id = cur_id;
   }
   add_adj(pre_id, 1); // 
-  if (para->result) writer->write_path(seq_id, path_node_ids);
+  if (para->result) {
+    if (writer) writer->write_path(seq_id, path_node_ids);
+    else paths.emplace_back(seq_id, std::move(path_node_ids));
+  }
   topsort(para, 0);
 }
 void graph::add_path(const para_t *para, int seq_id, const std::vector<res_t> &res, PathWriter *writer, int sink_id) {
@@ -243,8 +249,52 @@ void graph::add_path(const para_t *para, int seq_id, const std::vector<res_t> &r
   }
   is_topsorted = false;
 
-  if(para->result) writer->write_path(seq_id, path_node_ids);
+  if (para->result) {
+    if (writer) writer->write_path(seq_id, path_node_ids);
+    else paths.emplace_back(seq_id, std::move(path_node_ids));
+  }
   // std::cerr << "finish add path" << "\n";
+}
+
+uint8_t **graph::get_rc_msa(para_t *para, int n_seq, int *column_no, uint8_t gap_val) {
+  /*
+   * Always op == 1.  is_topsorted does not record WHICH variant ran, and only op == 1 collapses
+   * each aligned-node set onto a single rank -- which is what makes one rank mean one MSA column.
+   * Trusting the flag here would silently give node.size()-2 columns instead.
+   */
+  topsort(para, 1);
+
+  const int cols = rank.size() >= 2 ? (int)(rank.size() - 2) : 0;
+  *column_no = cols;
+
+  uint8_t **msa = (uint8_t **)calloc((size_t)(n_seq > 0 ? n_seq : 1), sizeof(uint8_t *));
+  if (msa == NULL) throw std::runtime_error("minipoa: out of memory allocating MSA row array");
+  for (int i = 0; i < n_seq; i++) {
+    // cols can be 0 for a degenerate graph; never malloc(0), the caller still free()s every row.
+    msa[i] = (uint8_t *)malloc((size_t)(cols > 0 ? cols : 1));
+    if (msa[i] == NULL) {
+      for (int j = 0; j < i; j++) free(msa[j]);
+      free(msa);
+      throw std::runtime_error("minipoa: out of memory allocating an MSA row");
+    }
+    memset(msa[i], gap_val, (size_t)cols);
+  }
+
+  for (size_t p = 0; p < paths.size(); p++) {
+    const int seq_id = paths[p].first;
+    if (seq_id < 0 || seq_id >= n_seq) continue; // not ours; never index out of the caller's array
+    uint8_t *row = msa[seq_id];
+    const std::vector<int> &node_ids = paths[p].second;
+    for (size_t q = 0; q < node_ids.size(); q++) {
+      const int node_id = node_ids[q];
+      // src is 0 and sink is 1; both are outside the MSA.  Signed compare first -- the upstream
+      // "node_id < node.size()" promotes a negative id to a huge unsigned and lets it through.
+      if (node_id < 2 || (size_t)node_id >= node.size()) continue;
+      const int rk = node[node[node_id].par_id].rank;
+      if (rk >= 1 && rk - 1 < cols) row[rk - 1] = (uint8_t)node[node_id].base;
+    }
+  }
+  return msa;
 }
 
 void graph::output_rc_msa(para_t *para, const std::vector<int> &rid_to_ord, const std::vector<seq_t> &seqs) {
@@ -270,7 +320,10 @@ void graph::output_rc_msa(para_t *para, const std::vector<int> &rid_to_ord, cons
   }
   std::string row(rank.size() - 2, '-');
   while (1) {
-    auto [seq_id, node_ids] = reader.read_next_path();
+    // std::pair rather than a structured binding: this is a -std=c++11 build.
+    std::pair<int32_t, std::vector<int> > rec = reader.read_next_path();
+    const int32_t seq_id = rec.first;
+    const std::vector<int> &node_ids = rec.second;
     if (seq_id == -1) break; // End of file check
     row.assign(rank.size() - 2, '-');
     for (int node_id : node_ids) {

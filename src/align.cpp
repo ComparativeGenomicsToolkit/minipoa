@@ -1,6 +1,7 @@
 #include "align.h"
 #include "simdpriv.h"
 #include <cassert>
+#include <stdexcept>
 #include <algorithm>
 #include <cstring>
 #include <chrono>
@@ -108,6 +109,17 @@ std::vector<res_t> poa(const para_t *para, const graph *DAG, int beg_id, int end
     mtx_size += offset;
     // sum += Me[i] - Ms[i] + 1;
   }
+  /*
+   * The scalar I loop below writes I_i[tj + 1], i.e. one int past row i's I array.  For every row
+   * but the last that lands in the next row's M left-padding, which is deliberate -- see the
+   * comment at that loop.  The last row has no next row, so the final write runs off the end of
+   * the buffer.  With a pooled buffer that happens to be over-allocated it lands in slack and is
+   * invisible; with an exactly-sized allocation it is a heap-buffer-overflow that silently
+   * corrupts whatever follows.  One more simd_width of slack closes it without disturbing the
+   * per-row layout.
+   */
+  invisible_size += simd_width;
+
   size_t sum = 0;
   void *buff = nullptr;
   if (para->verbose >= 2) std::cerr << "mtx size:" << (p_size + 3 * mtx_size) * sizeof(int) / 1024 / 1024 / 1024 << "GB" << "\n";
@@ -372,9 +384,9 @@ std::vector<res_t> poa(const para_t *para, const graph *DAG, int beg_id, int end
     j = calj(acj, Bs[i]);
     int aci = beg_i + i;
     if (acj >= Be[i] * simd_width || acj < Bs[i] * simd_width) {
-      std::cerr << "l:" << Bs[i] * simd_width << " " << "r:" << Be[i] * simd_width << "\n";
-      std::cerr << acj << "\n";
-      exit(0);
+      // Was exit(0) -- a SUCCESS code, so an embedding caller saw a clean exit and truncated
+      // output.  Throw instead; the C boundary turns it into a non-zero return.
+      throw std::runtime_error("minipoa: traceback left the band");
     }
     const node_t &cur = node[rank[aci]];
     int cur_base = i != n - 1 ? cur.base : char26_table['N'];
@@ -522,10 +534,9 @@ std::vector<res_t> poa(const para_t *para, const graph *DAG, int beg_id, int end
     }
     // std::cerr << n << " "<< m << " " << beg_id << " " << end_id << "\n";
     // std::cerr << aci << " " << acj << "\n";
-    std::cerr << " backtrack error" << "\n";
     // std::cerr << ans << " " << i << " " << j << "\n";
     // std::cerr << M[i][j] << " " << D[i][j] << " " << I[i][j] << " "<< op << "\n";
-    exit(1);
+    throw std::runtime_error("minipoa: backtrack found no predecessor");
 
   }
   res.emplace_back(res_t(beg_id, node[beg_id].base));

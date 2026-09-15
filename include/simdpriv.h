@@ -1,6 +1,20 @@
 #ifndef SIMDPRIV_H
 #define SIMDPRIV_H
+/*
+ * On x86 this is the real intrinsics header.  Elsewhere -- cactus builds for aarch64 too -- simde
+ * maps the same intrinsics onto NEON, which is exactly how abPOA handles the same problem.
+ * Define USE_SIMDE and SIMDE_ENABLE_NATIVE_ALIASES and put simde on the include path; the code
+ * below is then unchanged.
+ */
+#if defined(USE_SIMDE)
+#include <simde/x86/sse4.1.h>
+#include <simde/x86/avx2.h>
+#if defined(ENABLE_AVX512)
+#include <simde/x86/avx512.h>
+#endif
+#else
 #include <immintrin.h>
+#endif
 #include <cstddef>
 
 // ============================================================
@@ -91,8 +105,14 @@ inline simd_reg simd_max(simd_reg a, simd_reg b) {
   return _mm512_max_epi32(a, b);
 #elif defined(ENABLE_AVX2)
   return _mm256_max_epi32(a, b);
-#else
+#elif defined(__SSE4_1__)
   return _mm_max_epi32(a, b);
+#else
+  // _mm_max_epi32 is SSE4.1, not SSE2 -- it is the single intrinsic that forced the ENABLE_SSE2
+  // backend to be compiled with -msse4.1 despite its name.  Emulate it so a real -msse2 build
+  // works; simd_argmax already does the same blend this way.
+  simd_reg mask = _mm_cmpgt_epi32(a, b);
+  return _mm_or_si128(_mm_and_si128(mask, a), _mm_andnot_si128(mask, b));
 #endif
 }
 

@@ -1,7 +1,6 @@
 #ifndef MEM_ALLOC_UTILS_H
 #define MEM_ALLOC_UTILS_H
 #include <cstddef>
-#include <mm_malloc.h>
 #include <iostream>
 #include <cstring>
 // decrease page faults and assert memory aligned
@@ -29,6 +28,10 @@ struct aligned_buff_t {
     }
     if (size > buff_size) {
       free_aligned(buff);
+      // Clear before re-allocating: ::alloc_aligned throws on posix_memalign failure, and without
+      // this the destructor would then free() the pointer we just freed.  An OOM on a large
+      // window is exactly when that happens, and a double free is worse than the OOM.
+      buff = nullptr;
       // std::cerr << "*2\n";
       if (buff_size < 50LL * 1024 * 1024 * 1024) {
         buff_size *= 2; // 倍增

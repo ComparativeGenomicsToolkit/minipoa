@@ -8,3 +8,6 @@ nresult
 conda
 test.sh
 .cache
+# artifacts of the plain-make build
+*.o
+lib/

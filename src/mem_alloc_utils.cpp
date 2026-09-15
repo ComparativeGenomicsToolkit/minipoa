@@ -1,5 +1,10 @@
 #include "mem_alloc_utils.h"
-#include <mm_malloc.h>
+// No <mm_malloc.h>: nothing here uses _mm_malloc/_mm_free (it is posix_memalign/free), and gcc
+// ships that header only for x86 targets, so including it broke every aarch64 consumer of the
+// public headers -- mem_alloc_utils.h is reachable from minipoa.h via align.h.
+#include <cstdlib>
+#include <cerrno>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h> // 内存管理相关 (mlock, munlock, madvise)
 #include <iostream>

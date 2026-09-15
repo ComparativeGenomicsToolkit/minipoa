@@ -1,5 +1,6 @@
 #include "minimizer.h"
 #include <cassert>
+#include <stdexcept>
 #include <cstring>
 #include <iostream>
 #include "sequence.h"
@@ -283,8 +284,7 @@ void minimizer_t::get_guide_tree(para_t* para) {
         int tot_n = mm_hit_n[((i * (i + 1)) >> 1) + i] + mm_hit_n[((j * (j + 1)) >> 1) + j] - shared_n;
         if (tot_n == 0) jac = 0;
         else if (tot_n < 0) {
-          std::cerr << __func__ << "Bug in progressive tree building. (1)" << "\n";
-          exit(EXIT_FAILURE);
+          throw std::runtime_error("minipoa: negative union size building the progressive guide tree");
         }
         else {
           jac = (0.0 + shared_n) / tot_n;
