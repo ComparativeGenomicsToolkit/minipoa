@@ -40,11 +40,12 @@ static gap_piece_t make_gap_piece(int e, int o) {
  * I[0] + (j + 1) * e.  Within a block that is a decaying prefix max, which takes log2(simd_width)
  * vector steps instead of simd_width dependent scalar ones; blocks are chained through carry, the
  * I value entering the block, broadcast to every lane, which this advances to the next block's.
- * Returns I for the block's own columns.  The integers are exactly those of the scalar recurrence.
+ * Returns I for the block's own columns, and sets Inext to I one column on.  The integers are
+ * exactly those of the scalar recurrence.
  */
-static inline simd_reg gap_block(const gap_piece_t &g, simd_reg MD, simd_reg fill, simd_reg &carry) {
+static inline simd_reg gap_block(const gap_piece_t &g, simd_reg MD, simd_reg fill, simd_reg &carry, simd_reg &Inext) {
   simd_reg Iopen = simd_decaying_prefix_max(simd_add(MD, g.O), fill, g.E, g.E2, g.E4, g.E8);
-  simd_reg Inext = simd_max(Iopen, simd_add(carry, g.E_ramp)); // I[j + 1 .. j + simd_width]
+  Inext = simd_max(Iopen, simd_add(carry, g.E_ramp));    // I[j + 1 .. j + simd_width]
   simd_reg Icur = simd_shift_lanes_up<1>(Inext, carry);    // I[j .. j + simd_width - 1]
   // the last lane of Inext, without waiting on the shuffle of Inext itself
   carry = simd_max(simd_broadcast_last(Iopen), simd_add(carry, g.E_width));
@@ -52,15 +53,21 @@ static inline simd_reg gap_block(const gap_piece_t &g, simd_reg MD, simd_reg fil
 }
 
 /*
- * The gap states are stored as how far each falls below M, the cell's score, in 16 bits and
- * saturating, rather than as scores: 8 bytes a cell instead of 12, and 12 instead of 20 with a
- * convex gap.  The dp is memory-bound -- with 8 threads it runs no faster than with 2 -- so
- * bytes are time.
+ * What the dp keeps per cell.  It is memory-bound -- with 8 threads it runs no faster than with
+ * 2 -- so bytes are time.  M, the cell's score, is an int.
  *
- * Nothing changes.  The dp only uses a gap state g to extend it, max(g + e, M + o), and when g
- * is 65535 or more below M, M + o wins either way, whatever g's true value, as long as the open
- * penalty is under 65535.  The traceback only compares gap values on the path, which are within
- * an open penalty of their cell's M, so exact; and a saturated value cannot pass for one of those.
+ * The vertical gap states (D, and D2 for a convex gap) are read back by successor rows, so they
+ * are kept as values: as how far each falls below M, in 16 bits and saturating.  That changes
+ * nothing.  The dp only uses a gap state g to extend it, max(g + e, M + o), and when g is 65535
+ * or more below M, M + o wins either way, whatever g's true value, as long as the open penalty is
+ * under 65535.  The traceback only compares gap values on the path, which are within an open
+ * penalty of their cell's M, so exact; and a saturated value cannot pass for one of those.
+ *
+ * The horizontal ones (I, I2) never leave their row, and the traceback asks only two things of
+ * each: is it the cell's score, and did it open at this column rather than extend from the one
+ * before.  It is always one or the other, being the larger of the two.  So they are kept as those
+ * two bits, computed from the exact values: 6.25 bytes a cell against 12 for all ints, and 8.5
+ * against 20 with a convex gap.
  */
 static inline uint16_t gap_delta(int h, int v) {
   long long d = (long long)h - v;
@@ -208,6 +215,17 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
   size_t p_size = para_m * col_size;
   size_t invisible_size = 0;
   int ring_w = 0; // the widest row, which sizes the ring below
+  /*
+   * Per row: M, a block of padding either side, the vertical gaps as 16-bit distances below M,
+   * and for each block, two masks per horizontal piece (see gap_delta), all rounded up to a whole
+   * block so that every row's M stays aligned.
+   */
+  const int n_vgap = convex ? 2 : 1, n_ibits = convex ? 4 : 2;
+  auto row_tail_ints = [&](int offset) -> size_t {
+    size_t bytes = (size_t)n_vgap * offset * sizeof(uint16_t) + (size_t)(offset / simd_width) * n_ibits * sizeof(simd_bits_t);
+    return (bytes + SIMD_BYTES - 1) / SIMD_BYTES * simd_width;
+  };
+  size_t tail_ints = 0;
   for (int i = 0; i < n; i++) {
     // Ms[i] = 0, Me[i] = m;
     if (para->f > 0 && !ab_band) {
@@ -223,6 +241,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
     if (hlen[i] == NEG_INF || tlen[i] == NEG_INF) offset = 0;
     else invisible_size += 2 * simd_width;
     mtx_size += offset;
+    tail_ints += row_tail_ints(offset);
     ring_w = std::max(ring_w, offset);
     // sum += Me[i] - Ms[i] + 1;
   }
@@ -232,9 +251,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
 
   size_t sum = 0;
   void *buff = nullptr;
-  // M as ints, and n_gap gap states as 16-bit distances below it (see gap_delta)
-  const int n_gap = convex ? 4 : 2;
-  size_t mtx_ints = mtx_size + n_gap * mtx_size / 2;
+  size_t mtx_ints = mtx_size + tail_ints;
   /*
    * A row is written once, and read back by the dp only for its successors, which are nearly all
    * a few rows on (on 6 sequences, 99% of predecessor edges span 8 rows or fewer).  So each row
@@ -274,10 +291,11 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
   //   D[i] = D[i - 1] + offset;
   //   I[i] = I[i - 1] + offset;
   // }
-  // Row by row: M, then D and I (then D2 and I2, for a convex gap) as distances below M.  Read
-  // them through Dv/Iv/D2v/I2v below, never directly.
+  // Row by row: M, then D (and D2, for a convex gap) as distances below M, read through Dv/D2v
+  // below, never directly; then the masks that stand for I (and I2), read through Ibit.
   std::vector<int *> M(n);
-  std::vector<uint16_t *> D(n), I(n), D2(convex ? n : 0), I2(convex ? n : 0);
+  std::vector<uint16_t *> D(n), D2(convex ? n : 0);
+  std::vector<simd_bits_t *> Ibits(n);
   int *current_ptr = (int *)buff + p_size; // 跳过 Profile(P) 矩阵占用的空间
   for (int i = 0; i < n; i++) {
     int offset = (Be[i] - Bs[i]) * simd_width;
@@ -287,12 +305,9 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
     M[i] = current_ptr + simd_width;
     // M 的末尾保留 invisible_offset，防止后续 simd_loadu(M_p + pj - 1) 越界读取
     D[i] = (uint16_t *)(M[i] + offset + simd_width);
-    I[i] = D[i] + offset;
-    if (convex) {
-      D2[i] = I[i] + offset;
-      I2[i] = D2[i] + offset;
-    }
-    current_ptr += offset + n_gap * offset / 2 + invisible_offset;
+    if (convex) D2[i] = D[i] + offset;
+    Ibits[i] = (simd_bits_t *)(D[i] + n_vgap * offset);
+    current_ptr += offset + row_tail_ints(offset) + invisible_offset;
   }
   // the ring: per slot, M with a block of padding either side, then D (and D2) as distances
   int *ring = (int *)buff + p_size + (mtx_ints - RING_ROWS * ring_slot) + invisible_size;
@@ -300,9 +315,17 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
   auto ring_D = [&](int r) -> uint16_t * { return (uint16_t *)(ring_M(r) + ring_w + simd_width); };
   auto ring_D2 = [&](int r) -> uint16_t * { return ring_D(r) + ring_w; };
   auto Dv = [&](int r, int c) -> int { return M[r][c] - (int)D[r][c]; };
-  auto Iv = [&](int r, int c) -> int { return M[r][c] - (int)I[r][c]; };
   auto D2v = [&](int r, int c) -> int { return M[r][c] - (int)D2[r][c]; };
-  auto I2v = [&](int r, int c) -> int { return M[r][c] - (int)I2[r][c]; };
+  /*
+   * k = 0: I is the cell's score.  k = 1: I opened at this column, rather than extending.  The dp
+   * gets that one column early, lane-aligned -- I one column on, against this column's source --
+   * so it is stored as the bit of column c - 1 (the traceback never asks it of column 0).
+   * k = 2, 3: the same for I2.
+   */
+  auto Ibit = [&](int r, int c, int k) -> bool {
+    if (k & 1) c--;
+    return (Ibits[r][(c / simd_width) * n_ibits + k] >> (c % simd_width)) & 1;
+  };
 
   if (para->f > 0 && ab_band) {
     // Ms[i] = std::max(0, std::min(DAG->hlen[aci] - DAG->hlen[beg_i], m + DAG->tlen[aci] - DAG->tlen[end_i]) - w), Me[i] = std::min(m, std::max(DAG->hlen[aci] - DAG->hlen[beg_i], m + DAG->tlen[aci] - DAG->tlen[end_i]) + w);
@@ -314,7 +337,6 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
   int block_num = Be[0] - Bs[0]; // not contain Be[i] - 1 's block1
   int *M_i = M[0];
   uint16_t *D_i = D[0];
-  uint16_t *I_i = I[0];
   for (int bid = 0; bid < block_num; bid++) {
     // memset(M, 0xc0, col_size * sizeof(int));//M[0] = NEG_INF
     simd_store(M_i + bid * simd_width, Neg_inf);
@@ -326,9 +348,11 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
     // row 0 in full ints, then stored as distances below M like every other row
     int row0 = block_num * simd_width;
     std::vector<int> D0(row0, NEG_INF), I0(row0, NEG_INF), D20(row0, NEG_INF), I20(row0, NEG_INF);
+    std::vector<unsigned char> open1(row0, 0), open2(row0, 0); // I (I2) opened at this column
     if (!convex) {
       for (int j = 1; j < row0; j++) { // block_num * reg_size
         I0[j] = std::max(I0[j - 1] + e1, M_i[j - 1] + o1); // isource
+        open1[j] = I0[j] == M_i[j - 1] + o1;
         M_i[j] = std::max({ M_i[j], D0[j], I0[j] });  // three source
       }
     }
@@ -339,14 +363,24 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
       for (int j = 1; j < row0; j++) {
         I0[j] = std::max(I0[j - 1] + e1, md_prev + o1);
         I20[j] = std::max(I20[j - 1] + e2, md_prev + o2);
+        open1[j] = I0[j] == md_prev + o1, open2[j] = I20[j] == md_prev + o2;
         md_prev = std::max({ M_i[j], D0[j], D20[j] });
         M_i[j] = std::max({ md_prev, I0[j], I20[j] });
       }
     }
     for (int j = 0; j < row0; j++) {
       D_i[j] = gap_delta(M_i[j], D0[j]);
-      I_i[j] = gap_delta(M_i[j], I0[j]);
-      if (convex) D2[0][j] = gap_delta(M_i[j], D20[j]), I2[0][j] = gap_delta(M_i[j], I20[j]);
+      if (convex) D2[0][j] = gap_delta(M_i[j], D20[j]);
+    }
+    for (int bid = 0; bid < block_num; bid++) {
+      unsigned bits[4] = { 0, 0, 0, 0 };
+      for (int v = 0; v < simd_width; v++) {
+        int j = bid * simd_width + v;
+        bool last = j + 1 >= row0; // the "opened" bits are stored a column early, see Ibit
+        bits[0] |= (unsigned)(M_i[j] == I0[j]) << v, bits[1] |= (unsigned)(!last && open1[j + 1]) << v;
+        bits[2] |= (unsigned)(M_i[j] == I20[j]) << v, bits[3] |= (unsigned)(!last && open2[j + 1]) << v;
+      }
+      for (int k = 0; k < n_ibits; k++) Ibits[0][bid * n_ibits + k] = (simd_bits_t)bits[k];
     }
     // and into the ring, padding included, for its successors
     memcpy(ring_M(0) - simd_width, M_i - simd_width, (row0 + 2 * simd_width) * sizeof(int));
@@ -366,7 +400,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
     if (hlen[i] == NEG_INF || tlen[i] == NEG_INF) continue;
     M_i = M[i];
     D_i = D[i];
-    I_i = I[i];
+    simd_bits_t *bits_i = Ibits[i];
     int *rM = ring_M(i); // this row's slot in the ring
     uint16_t *rD = ring_D(i), *rD2 = convex ? ring_D2(i) : nullptr;
     if (para->f > 0 && ab_band) {  // adptive band
@@ -407,11 +441,8 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
         int j = bid * simd_width;
         simd_store(M_i + j, Neg_inf), simd_store(rM + j, Neg_inf);
         simd_store_u16_sat(D_i + j, Zero), simd_store_u16_sat(rD + j, Zero);
-        simd_store_u16_sat(I_i + j, Zero);
-        if (convex) {
-          simd_store_u16_sat(D2[i] + j, Zero), simd_store_u16_sat(rD2 + j, Zero);
-          simd_store_u16_sat(I2[i] + j, Zero);
-        }
+        if (convex) simd_store_u16_sat(D2[i] + j, Zero), simd_store_u16_sat(rD2 + j, Zero);
+        for (int k = 0; k < n_ibits; k++) bits_i[bid * n_ibits + k] = 0;
       }
     }
     else if (convex) {
@@ -419,7 +450,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
       // max(M, D, D2), not from each other, so that each is its own scan.
       int cur_base = i != n - 1 ? cur.base : char26_table['N'];
       const int *P_i = P[cur_base] + Bs[i] * simd_width;
-      uint16_t *D2_i = D2[i], *I2_i = I2[i];
+      uint16_t *D2_i = D2[i];
       simd_reg carry = Neg_inf, carry2 = Neg_inf;
       for (int bid = 0; bid < block_num; bid++) {
         int j = bid * simd_width;
@@ -435,14 +466,19 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
           D2ij = simd_max(D2ij, simd_max(simd_add(D2p, E2g), simd_add(Mp, O2g)));
         }
         simd_reg MD = simd_max(simd_max(simd_add(Mij, simd_load(P_i + j)), Dij), D2ij);
-        simd_reg Icur = gap_block(gap1, MD, Scan_fill, carry);
-        simd_reg I2cur = gap_block(gap2, MD, Scan_fill, carry2);
+        simd_reg Inext, I2next;
+        simd_reg Icur = gap_block(gap1, MD, Scan_fill, carry, Inext);
+        simd_reg I2cur = gap_block(gap2, MD, Scan_fill, carry2, I2next);
         simd_reg H = simd_max(MD, simd_max(Icur, I2cur));
         simd_half hD = simd_pack_u16_sat(simd_sub(H, Dij)), hD2 = simd_pack_u16_sat(simd_sub(H, D2ij));
         simd_store(rM + j, H), simd_store_half(rD + j, hD), simd_store_half(rD2 + j, hD2);
         simd_stream(M_i + j, H), simd_stream_half(D_i + j, hD), simd_stream_half(D2_i + j, hD2);
-        simd_stream_half(I_i + j, simd_pack_u16_sat(simd_sub(H, Icur)));
-        simd_stream_half(I2_i + j, simd_pack_u16_sat(simd_sub(H, I2cur)));
+        // each piece opens from this column's max(M, D, D2), as the traceback checks (see Ibit)
+        simd_bits_t *b = bits_i + bid * 4;
+        b[0] = simd_eq_mask(Icur, H);
+        b[1] = simd_eq_mask(Inext, simd_add(MD, O1));
+        b[2] = simd_eq_mask(I2cur, H);
+        b[3] = simd_eq_mask(I2next, simd_add(MD, O2g));
       }
     }
     else {
@@ -458,12 +494,16 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
       simd_reg carry = Neg_inf;
       auto finish_block = [&](int j, simd_reg Mij, simd_reg Dij) {
         simd_reg MD = simd_max(simd_add(Mij, simd_load(P_i + j)), Dij);
-        simd_reg Icur = gap_block(gap1, MD, Scan_fill, carry);
+        simd_reg Inext;
+        simd_reg Icur = gap_block(gap1, MD, Scan_fill, carry, Inext);
         simd_reg H = simd_max(MD, Icur);
         simd_half hD = simd_pack_u16_sat(simd_sub(H, Dij));
         simd_store(rM + j, H), simd_store_half(rD + j, hD);
         simd_stream(M_i + j, H), simd_stream_half(D_i + j, hD);
-        simd_stream_half(I_i + j, simd_pack_u16_sat(simd_sub(H, Icur)));
+        // I opens from this column's score, M, as the traceback has always checked (see Ibit)
+        simd_bits_t *b = bits_i + (j / simd_width) * 2;
+        b[0] = simd_eq_mask(Icur, H);
+        b[1] = simd_eq_mask(Inext, simd_add(H, O1));
       };
       if (pre_num == 1) { // most nodes
         const pre_band_t pb = pre_band[0];
@@ -680,13 +720,18 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
         continue;
       }
       if (acj > 0 && j - 1 >= 0) {
-        if (op & I_OP && (op == I_OP || target == Iv(i, j))) {
-          if (Iv(i, j) == md_at(i, acj - 1) + o1) { res.emplace_back(res_t(-1, seq[acj])); op = MD_OP; acj--; continue; }
-          if (Iv(i, j) == Iv(i, j - 1) + e1) { res.emplace_back(res_t(-1, seq[acj])); op = I_OP; acj--; continue; }
+        // target is the cell's score whenever op allows I or I2; they opened here or extended
+        if (op & I_OP && (op == I_OP || Ibit(i, j, 0))) {
+          res.emplace_back(res_t(-1, seq[acj]));
+          op = Ibit(i, j, 1) ? MD_OP : I_OP;
+          acj--;
+          continue;
         }
-        if (op & I2_OP && (op == I2_OP || target == I2v(i, j))) {
-          if (I2v(i, j) == md_at(i, acj - 1) + o2) { res.emplace_back(res_t(-1, seq[acj])); op = MD_OP; acj--; continue; }
-          if (I2v(i, j) == I2v(i, j - 1) + e2) { res.emplace_back(res_t(-1, seq[acj])); op = I2_OP; acj--; continue; }
+        if (op & I2_OP && (op == I2_OP || Ibit(i, j, 2))) {
+          res.emplace_back(res_t(-1, seq[acj]));
+          op = Ibit(i, j, 3) ? MD_OP : I2_OP;
+          acj--;
+          continue;
         }
       }
       if (op & M_OP && acj > 0) { // match or mismatch
@@ -795,20 +840,12 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
     }
     if (op & I_OP && acj > 0) {
       if (j - 1 >= 0) {
-        if (op == I_OP || M[i][j] == Iv(i, j)) {
-          // std::cerr << "I";
-          if (Iv(i, j) == M[i][j - 1] + o1) {
-            res.emplace_back(res_t(-1, seq[acj]));
-            op = M_OP | D_OP;
-            acj--;
-            continue;
-          }
-          if (Iv(i, j) == Iv(i, j - 1) + e1) {
-            res.emplace_back(res_t(-1, seq[acj]));
-            op = I_OP;
-            acj--;
-            continue;
-          }
+        if (op == I_OP || Ibit(i, j, 0)) {
+          // I opened here, from M of the column before, or extended from its I
+          res.emplace_back(res_t(-1, seq[acj]));
+          op = Ibit(i, j, 1) ? M_OP | D_OP : I_OP;
+          acj--;
+          continue;
         }
       }
     }

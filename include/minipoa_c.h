@@ -47,9 +47,9 @@ void minipoa_set_score_matrix(minipoa_para_t *p, const int *mat25);
 void minipoa_set_gap(minipoa_para_t *p, int gap_open, int gap_ext);
 /*
  * An optional second gap piece, also POSITIVE, making the gap cost convex exactly as abPOA's is:
- * a length-L gap costs min(gap_open + L * gap_ext, gap_open2 + L * gap_ext2).  It adds two dp
- * matrices, so costs about half as much again in memory and time.  Both 0 (the default) turns
- * it off.
+ * a length-L gap costs min(gap_open + L * gap_ext, gap_open2 + L * gap_ext2).  It adds a gap
+ * state in each direction, which costs about a third more memory and time.  Both 0 (the default)
+ * turns it off.
  */
 void minipoa_set_gap2(minipoa_para_t *p, int gap_open2, int gap_ext2);
 

@@ -203,6 +203,26 @@ inline void simd_store_half(uint16_t* p, simd_half h) {
 inline void simd_store_u16_sat(uint16_t* p, simd_reg v) { simd_store_half(p, simd_pack_u16_sat(v)); }
 
 // ============================================================
+//  Lane masks: bit v set where lane v of a equals lane v of b
+// ============================================================
+
+#if defined(ENABLE_AVX512)
+using simd_bits_t = uint16_t;
+#else
+using simd_bits_t = uint8_t;
+#endif
+
+inline simd_bits_t simd_eq_mask(simd_reg a, simd_reg b) {
+#if defined(ENABLE_AVX512)
+  return (simd_bits_t)_mm512_cmpeq_epi32_mask(a, b);
+#elif defined(ENABLE_AVX2)
+  return (simd_bits_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, b)));
+#else
+  return (simd_bits_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a, b)));
+#endif
+}
+
+// ============================================================
 //  Non-temporal (streaming) stores: to memory without first reading the line into cache.  For
 //  data written once and not read again soon.  simd_stream_fence() orders them before later
 //  stores; the 64-bit-lane path has no 8-byte streaming store and stores normally.
