@@ -11,6 +11,7 @@
 #include "minimizer.h"
 #include "parameter.h"
 #include "sequence.h"
+#include "simdpriv.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -22,6 +23,20 @@
 
 struct minipoa_para_s {
   para_t para;
+
+  /*
+   * DP scratch, kept between calls and handed to one call at a time.  A window's matrices run to
+   * hundreds of MB, and a buffer made fresh for every call has to be faulted in again every time:
+   * on 8Mb of human/mouse through bar that was 49 million page faults and more system time than
+   * alignment time.  Freed with the handle, so the memory is held for as long as the handle is:
+   * one buffer per thread that has called in concurrently, each the size of its largest window.
+   */
+  std::mutex pool_mutex;
+  std::vector<aligned_buff_t *> pools;
+
+  ~minipoa_para_s() {
+    for (aligned_buff_t *pool : pools) delete pool;
+  }
 };
 
 namespace {
@@ -46,6 +61,45 @@ void init_alphabet_tables_once() {
     initPara(&probe); // mat_fp empty -> nucleotide tables
   });
 }
+
+// Borrows a scratch buffer from the handle for the length of one call.
+class pool_lease {
+public:
+  explicit pool_lease(minipoa_para_s *owner) : owner_(owner), pool_(nullptr) {
+    {
+      std::lock_guard<std::mutex> guard(owner_->pool_mutex);
+      if (!owner_->pools.empty()) {
+        pool_ = owner_->pools.back();
+        owner_->pools.pop_back();
+      }
+    }
+    if (pool_ == nullptr) pool_ = new aligned_buff_t();
+  }
+  ~pool_lease() {
+    // A buffer whose last allocation failed has no memory but remembers the size that failed,
+    // and would ask for it again on every later call: drop it, and the next call starts fresh.
+    if (pool_->buff == nullptr) {
+      delete pool_;
+      return;
+    }
+    // The dp streams into the buffer; make sure all of it has landed before another thread can
+    // borrow it.  (poa() fences as it finishes, but not when it throws part way.)
+    simd_stream_fence();
+    try {
+      std::lock_guard<std::mutex> guard(owner_->pool_mutex);
+      owner_->pools.push_back(pool_);
+    } catch (...) {
+      delete pool_;
+    }
+  }
+  aligned_buff_t *get() const { return pool_; }
+
+private:
+  pool_lease(const pool_lease &);
+  pool_lease &operator=(const pool_lease &);
+  minipoa_para_s *owner_;
+  aligned_buff_t *pool_;
+};
 
 std::string &last_error_slot() {
   static thread_local std::string msg("no error");
@@ -132,6 +186,12 @@ void minipoa_set_gap(minipoa_para_t *p, int gap_open, int gap_ext) {
   p->para.gap_ext1 = -(gap_ext < 0 ? -gap_ext : gap_ext);
 }
 
+void minipoa_set_gap2(minipoa_para_t *p, int gap_open2, int gap_ext2) {
+  if (!p) return;
+  p->para.gap_open2 = -(gap_open2 < 0 ? -gap_open2 : gap_open2);
+  p->para.gap_ext2 = -(gap_ext2 < 0 ? -gap_ext2 : gap_ext2);
+}
+
 void minipoa_set_band(minipoa_para_t *p, int band_constant, double band_fraction) {
   if (!p) return;
   p->para.b = band_constant;
@@ -204,16 +264,15 @@ int minipoa_msa(const minipoa_para_t *p, int n_seqs, const int *seq_lens,
     minimizer_t mm(&para, seq_v);
     if (para.progressive_poa) mm.get_guide_tree(&para);
 
-    // One scratch buffer, constructed and destroyed per call.  It grows by doubling and never
-    // shrinks, so a long-lived one would pin the largest window's high-water mark for the
-    // process.  Passing null instead would leak it if the DP throws.
-    aligned_buff_t pool;
+    // Borrowed from the handle and returned to it however this call ends; see minipoa_para_s.
+    // The handle is const to callers, but lending out its scratch is thread-safe.
+    pool_lease pool(const_cast<minipoa_para_t *>(p));
 
     for (size_t step = 0; step < seq_v.size(); step++) {
       const int rid = mm.ord.empty() ? (int)step : mm.ord[step];
       std::vector<res_t> res = alignment(&para, &dag, &mm, rid,
                                          seq_v[(size_t)rid].seq.c_str(),
-                                         (int)seq_v[(size_t)rid].seq.size(), &pool);
+                                         (int)seq_v[(size_t)rid].seq.size(), pool.get());
       dag.add_path(&para, rid, res, /*writer=*/0, /*sink_id=*/1);
       dag.topsort(&para, 0);
     }

@@ -201,6 +201,9 @@ void minimizer_t::init(para_t* para, const std::vector<seq_t>& seqs) {
 
 };
 
+// A minimizer in at most this many sequences is always used to build the guide tree.
+static const int MM_FILTER_MIN_SEQS = 16;
+
 void minimizer_t::get_guide_tree(para_t* para) {
   if (para->progressive_poa && seqs_size >= 2) {
     // copy mm1 to mm2
@@ -245,7 +248,14 @@ void minimizer_t::get_guide_tree(para_t* para) {
         }
 
         // -------------------------------------------------------------
-        if (present_rids.size() > seqs_size * para->mm_filter_ratio) { 
+        /*
+         * Skip minimizers common to so many sequences that they cannot tell them apart -- but
+         * never ones shared by only a handful.  As a bare ratio this dropped every minimizer
+         * found in more than a quarter of the sequences, which below 8 sequences is every
+         * minimizer shared by two of them: all similarities came out 0 and the "guide tree" was
+         * the input order, for exactly the few-row windows progressive cactus aligns.
+         */
+        if (present_rids.size() > std::max((double)seqs_size * para->mm_filter_ratio, (double)MM_FILTER_MIN_SEQS)) { 
             for (int r : present_rids) mm_cnt[r] = 0; // 重置清理
             if (i < mm_tv.n) { last_x = mm_tv.a[i].x; _i = i; }
             continue; 

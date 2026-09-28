@@ -71,7 +71,8 @@ mm128_t* mg_chain_backtrack(void* km, int64_t n, const int32_t* f, const mm128_t
   memset(t, 0, n * sizeof(int32_t));
 
   for (i = n - 1, n_z = 0; i >= 0; i--) {
-    if (t[p[i]] == 0 && f[i] >= 0 && f[i] >= min_sc) {
+    // p[i] is -1 for an anchor with no predecessor, and t[-1] is off the front of the array
+    if ((p[i] < 0 || t[p[i]] == 0) && f[i] >= 0 && f[i] >= min_sc) {
       ++n_z;
       t[i] = 2;
     }
