@@ -627,7 +627,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
   int i = n - 1, acj = m - 1;
   int j = calj(acj, Bs[i]);
   // int ans = M[i][j];
-  int op = M_OP;
+  int op = ALL_OP;
   if (para->verbose >= 2) std::cerr << "band mode:" << ab_band << "\n";
   if (para->verbose >= 2) std::cerr << "score:" << M[i][j] << "\n";
   total_part1 += std::chrono::duration_cast<std::chrono::microseconds>(end1 - start1);
@@ -781,7 +781,10 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
       if (bk != -1 && cur.in_weight[bk] >= cur.ind / 10) {  // backtrack based on the normal sample
         const node_t &pre = node[cur.in[bk]];
         int p = pre.rank - beg_i; // rank
-        if (cur_base == seq[acj]) {
+        if (i == n - 1 && acj != m - 1) {
+          res.emplace_back(res_t(-1, seq[acj]));
+        }
+        else if (cur_base == seq[acj]) {
           // std::cout << "M";
           res.emplace_back(res_t(cur.id, cur.base));
         }
@@ -878,7 +881,10 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
         // std::cerr << "M";
         const node_t &pre = node[cur.in[bk]];
         int p = pre.rank - beg_i; // rank
-        if (cur_base == seq[acj]) {
+        if (i == n - 1 && acj != m - 1) {
+          res.emplace_back(res_t(-1, seq[acj]));
+        }
+        else if (cur_base == seq[acj]) {
           // std::cout << "M";
           res.emplace_back(res_t(cur.id, cur.base));
         }
