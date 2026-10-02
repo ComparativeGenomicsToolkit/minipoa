@@ -643,6 +643,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
      * it, rather than the stored score.
      */
     const int D2_OP = 8, I2_OP = 16, ALL2_OP = 31, MD_OP = M_OP | D_OP | D2_OP;
+    op = ALL2_OP; // the end cell is the max of all five states, like any other
     auto md_at = [&](int ri, int racj) -> int {
       int rj = calj(racj, Bs[ri]);
       int v = std::max(Dv(ri, rj), D2v(ri, rj));
@@ -669,8 +670,10 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
       }
       return bk;
     };
-    auto emit_diag = [&](const node_t &cur, int cur_base, int racj) {
-      if (cur_base == seq[racj]) res.emplace_back(res_t(cur.id, cur.base));
+    auto emit_diag = [&](int ri, const node_t &cur, int cur_base, int racj) {
+      // the end row's N is virtual: a real query base scored against it is an insertion
+      if (ri == n - 1 && racj != m - 1) res.emplace_back(res_t(-1, seq[racj]));
+      else if (cur_base == seq[racj]) res.emplace_back(res_t(cur.id, cur.base));
       else {
         const node_t &par = node[cur.par_id];
         if (par.aligned_node[seq[racj]] != -1) res.emplace_back(res_t(par.aligned_node[seq[racj]], seq[racj]));
@@ -705,7 +708,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
       if (op & M_OP && acj > 0 && cur_base == seq[acj]) { // a match, along a well-used edge
         int bk = diag_pred(cur, acj, target, p_score);
         if (bk != -1 && cur.in_weight[bk] >= cur.ind / 10) {
-          emit_diag(cur, cur_base, acj);
+          emit_diag(i, cur, cur_base, acj);
           op = ALL2_OP;
           i = node[cur.in[bk]].rank - beg_i, acj--;
           continue;
@@ -737,7 +740,7 @@ static std::vector<res_t> poa_banded(const para_t *para, const graph *DAG, int b
       if (op & M_OP && acj > 0) { // match or mismatch
         int bk2 = diag_pred(cur, acj, target, p_score);
         if (bk2 != -1) {
-          emit_diag(cur, cur_base, acj);
+          emit_diag(i, cur, cur_base, acj);
           op = ALL2_OP;
           i = node[cur.in[bk2]].rank - beg_i, acj--;
           continue;
