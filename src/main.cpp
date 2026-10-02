@@ -21,6 +21,8 @@ int main(int argc, char **argv) {
     ("X,mismatch", "mismatch penalty", cxxopts::value<int>()->default_value("-4"))
     ("O,gap_open", "gap open penalty", cxxopts::value<int>()->default_value("-4"))
     ("E,gap_ext", "gap extension penalty", cxxopts::value<int>()->default_value("-2"))
+    ("gap_open2", "second gap open penalty, for a convex gap cost min(O + L*E, O2 + L*E2); 0 = off", cxxopts::value<int>()->default_value("0"))
+    ("gap_ext2", "second gap extension penalty", cxxopts::value<int>()->default_value("0"))
     ("t,thread", "thread number", cxxopts::value<int>()->default_value("1"))
     ("b,band_b", "base band width (total band = b + seq_len / f)", cxxopts::value<int>()->default_value("100"))
     ("f,band_f", "band expansion factor (smaller = wider band)", cxxopts::value<int>()->default_value("40"))
@@ -67,6 +69,8 @@ int main(int argc, char **argv) {
     para->mismatch = result["mismatch"].as<int>();
     para->gap_open1 = result["gap_open"].as<int>();
     para->gap_ext1 = result["gap_ext"].as<int>();
+    para->gap_open2 = result["gap_open2"].as<int>();
+    para->gap_ext2 = result["gap_ext2"].as<int>();
     para->b = result["band_b"].as<int>();
     para->f = result["band_f"].as<int>();
     para->ab_band = result["ab_band"].as<bool>();

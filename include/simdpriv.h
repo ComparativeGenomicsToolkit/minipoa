@@ -16,6 +16,7 @@
 #include <immintrin.h>
 #endif
 #include <cstddef>
+#include <cstdint>
 
 // ============================================================
 //  SIMD backend selection (controlled by CMake)
@@ -100,6 +101,16 @@ inline simd_reg simd_add(simd_reg a, simd_reg b) {
 #endif
 }
 
+inline simd_reg simd_sub(simd_reg a, simd_reg b) {
+#if defined(ENABLE_AVX512)
+  return _mm512_sub_epi32(a, b);
+#elif defined(ENABLE_AVX2)
+  return _mm256_sub_epi32(a, b);
+#else
+  return _mm_sub_epi32(a, b);
+#endif
+}
+
 inline simd_reg simd_max(simd_reg a, simd_reg b) {
 #if defined(ENABLE_AVX512)
   return _mm512_max_epi32(a, b);
@@ -140,6 +151,153 @@ inline simd_reg simd_set_prev_and_load(int prev, const int* p) {
       p[0], p[1], p[2]
   );
 #endif
+}
+
+// ============================================================
+//  16-bit storage
+//  simd_width unsigned 16-bit values, widened to / narrowed from the 32-bit lanes of a simd_reg.
+//  p must be aligned to simd_width * 2 bytes.
+// ============================================================
+
+inline simd_reg simd_load_u16(const uint16_t* p) {
+#if defined(ENABLE_AVX512)
+  return _mm512_cvtepu16_epi32(_mm256_load_si256(reinterpret_cast<const __m256i*>(p)));
+#elif defined(ENABLE_AVX2)
+  return _mm256_cvtepu16_epi32(_mm_load_si128(reinterpret_cast<const __m128i*>(p)));
+#else
+  return _mm_unpacklo_epi16(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)), _mm_setzero_si128());
+#endif
+}
+
+// simd_width 16-bit values: half a simd_reg (a quarter of one on the 128-bit path)
+#if defined(ENABLE_AVX512)
+using simd_half = __m256i;
+#else
+using simd_half = __m128i;
+#endif
+
+// v must be non-negative; lanes above 65535 come out as 65535
+inline simd_half simd_pack_u16_sat(simd_reg v) {
+#if defined(ENABLE_AVX512)
+  return _mm512_cvtusepi32_epi16(v);
+#elif defined(ENABLE_AVX2)
+  // packus works within each 128-bit half, so gather the two halves' results into the low one
+  return _mm256_castsi256_si128(_mm256_permute4x64_epi64(_mm256_packus_epi32(v, v), 0x08));
+#else
+  // packus_epi32 is SSE4.1: shift into signed range, saturate with the SSE2 signed pack, shift back
+  __m128i biased = _mm_sub_epi32(v, _mm_set1_epi32(32768));
+  return _mm_xor_si128(_mm_packs_epi32(biased, biased), _mm_set1_epi16((short)0x8000));
+#endif
+}
+
+inline void simd_store_half(uint16_t* p, simd_half h) {
+#if defined(ENABLE_AVX512)
+  _mm256_store_si256(reinterpret_cast<__m256i*>(p), h);
+#elif defined(ENABLE_AVX2)
+  _mm_store_si128(reinterpret_cast<__m128i*>(p), h);
+#else
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(p), h);
+#endif
+}
+
+inline void simd_store_u16_sat(uint16_t* p, simd_reg v) { simd_store_half(p, simd_pack_u16_sat(v)); }
+
+// ============================================================
+//  Lane masks: bit v set where lane v of a equals lane v of b
+// ============================================================
+
+#if defined(ENABLE_AVX512)
+using simd_bits_t = uint16_t;
+#else
+using simd_bits_t = uint8_t;
+#endif
+
+inline simd_bits_t simd_eq_mask(simd_reg a, simd_reg b) {
+#if defined(ENABLE_AVX512)
+  return (simd_bits_t)_mm512_cmpeq_epi32_mask(a, b);
+#elif defined(ENABLE_AVX2)
+  return (simd_bits_t)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(a, b)));
+#else
+  return (simd_bits_t)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a, b)));
+#endif
+}
+
+// ============================================================
+//  Non-temporal (streaming) stores: to memory without first reading the line into cache.  For
+//  data written once and not read again soon.  simd_stream_fence() orders them before later
+//  stores; the 64-bit-lane path has no 8-byte streaming store and stores normally.
+// ============================================================
+
+inline void simd_stream(int* p, simd_reg v) {
+#if defined(ENABLE_AVX512)
+  _mm512_stream_si512(reinterpret_cast<__m512i*>(p), v);
+#elif defined(ENABLE_AVX2)
+  _mm256_stream_si256(reinterpret_cast<__m256i*>(p), v);
+#else
+  _mm_stream_si128(reinterpret_cast<__m128i*>(p), v);
+#endif
+}
+
+inline void simd_stream_half(uint16_t* p, simd_half h) {
+#if defined(ENABLE_AVX512)
+  _mm256_stream_si256(reinterpret_cast<__m256i*>(p), h);
+#elif defined(ENABLE_AVX2)
+  _mm_stream_si128(reinterpret_cast<__m128i*>(p), h);
+#else
+  _mm_storel_epi64(reinterpret_cast<__m128i*>(p), h);
+#endif
+}
+
+inline void simd_stream_fence() { _mm_sfence(); }
+
+// ============================================================
+//  Lane shifts, for the horizontal gap scan
+//  lane i = v[i - S], lanes below S = fill (fill must hold the same value in every lane)
+// ============================================================
+
+template <int S>
+inline simd_reg simd_shift_lanes_up(simd_reg v, simd_reg fill) {
+#if defined(ENABLE_AVX512)
+  return _mm512_alignr_epi32(v, fill, 16 - S);
+#elif defined(ENABLE_AVX2)
+  // t = [fill low half, v low half]; the per-128-bit alignr then pulls each half's missing low
+  // lanes from t.  S == 4 is t itself (alignr by 0).
+  __m256i t = _mm256_permute2x128_si256(v, fill, 0x02);
+  return _mm256_alignr_epi8(v, t, 16 - 4 * S);
+#else
+  // Plain SSE2, so the -msse2 build works too.
+  return _mm_or_si128(_mm_slli_si128(v, 4 * S), _mm_srli_si128(fill, 16 - 4 * S));
+#endif
+}
+
+// every lane = the last lane of v
+inline simd_reg simd_broadcast_last(simd_reg v) {
+#if defined(ENABLE_AVX512)
+  return _mm512_permutexvar_epi32(_mm512_set1_epi32(15), v);
+#elif defined(ENABLE_AVX2)
+  return _mm256_permutevar8x32_epi32(v, _mm256_set1_epi32(7));
+#else
+  return _mm_shuffle_epi32(v, 0xFF);
+#endif
+}
+
+/*
+ * S[v] = max over u <= v of (x[u] + (v - u) * e), a running max that decays by e (<= 0) per lane,
+ * in log2(simd_width) shift/add/max steps.  Ek[s] holds s * e broadcast, for s = 1, 2, 4, 8.
+ * fill must be low enough that fill + (simd_width / 2) * e can never beat a real score, and must
+ * not overflow when that is added to it.
+ */
+inline simd_reg simd_decaying_prefix_max(simd_reg x, simd_reg fill, simd_reg E1, simd_reg E2, simd_reg E4, simd_reg E8) {
+  x = simd_max(x, simd_add(simd_shift_lanes_up<1>(x, fill), E1));
+  x = simd_max(x, simd_add(simd_shift_lanes_up<2>(x, fill), E2));
+#if defined(ENABLE_AVX512) || defined(ENABLE_AVX2)
+  x = simd_max(x, simd_add(simd_shift_lanes_up<4>(x, fill), E4));
+#endif
+#if defined(ENABLE_AVX512)
+  x = simd_max(x, simd_add(simd_shift_lanes_up<8>(x, fill), E8));
+#endif
+  (void)E4; (void)E8;
+  return x;
 }
 
 // ============================================================

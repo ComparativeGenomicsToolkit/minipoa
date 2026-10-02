@@ -60,6 +60,8 @@ void initPara(para_t* para) {
   if (para->mismatch > 0) para->mismatch *= -1;
   if (para->gap_open1 > 0) para->gap_open1 *= -1;
   if (para->gap_ext1 > 0) para->gap_ext1 *= -1;
+  if (para->gap_open2 > 0) para->gap_open2 *= -1;
+  if (para->gap_ext2 > 0) para->gap_ext2 *= -1;
   if (para->mat_fp.empty()) {
     para->m = 5; // default m = Nucleotide num
     int m = para->m;

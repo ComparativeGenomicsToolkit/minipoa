@@ -42,9 +42,16 @@ void minipoa_set_score_matrix(minipoa_para_t *p, const int *mat25);
 
 /*
  * Gap penalties in abPOA's convention: POSITIVE numbers, cost of a length-L gap being
- * gap_open + L * gap_ext.  minipoa has only one gap piece, so there is no convex second piece.
+ * gap_open + L * gap_ext.
  */
 void minipoa_set_gap(minipoa_para_t *p, int gap_open, int gap_ext);
+/*
+ * An optional second gap piece, also POSITIVE, making the gap cost convex exactly as abPOA's is:
+ * a length-L gap costs min(gap_open + L * gap_ext, gap_open2 + L * gap_ext2).  It adds a gap
+ * state in each direction, which costs about a third more memory and time.  Both 0 (the default)
+ * turns it off.
+ */
+void minipoa_set_gap2(minipoa_para_t *p, int gap_open2, int gap_ext2);
 
 /*
  * Band half-width, expressed as abPOA does it: band = band_constant + band_fraction * qlen.
